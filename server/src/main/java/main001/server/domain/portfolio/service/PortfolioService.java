@@ -1,6 +1,26 @@
 package main001.server.domain.portfolio.service;
 
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3Client;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.GetObjectRequest;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.S3Object;
+import com.amazonaws.services.s3.model.S3ObjectInputStream;
+import com.amazonaws.util.CollectionUtils;
+import com.amazonaws.util.IOUtils;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import main001.server.amazon.s3.service.S3Service;
+import main001.server.domain.attachment.file.entity.FileAttachment;
+import main001.server.domain.attachment.file.repository.FileAttachmentRepository;
+import main001.server.domain.attachment.image.entity.ImageAttachment;
+import main001.server.domain.attachment.image.repository.ImageAttachmentRepository;
 import main001.server.domain.portfolio.entity.Portfolio;
 import main001.server.domain.portfolio.repository.PortfolioRepository;
 import main001.server.domain.skill.entity.PortfolioSkill;
@@ -10,33 +30,48 @@ import main001.server.domain.user.repository.UserRepository;
 import main001.server.domain.user.service.UserService;
 import main001.server.exception.BusinessLogicException;
 import main001.server.exception.ExceptionCode;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
 import javax.persistence.EntityNotFoundException;
 import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.awt.*;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.text.SimpleDateFormat;
 import java.time.LocalDateTime;
+
 import java.time.temporal.ChronoUnit;
+import java.util.*;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
 
 
+@Slf4j
 @Service
 @Transactional
 @RequiredArgsConstructor
 public class PortfolioService {
     private final PortfolioRepository portfolioRepository;
     private final UserRepository userRepository;
+    private final Gson gson;
+    private final S3Service s3Service;
+
+    private final ImageAttachmentRepository imageAttachmentRepository;
+    private final FileAttachmentRepository fileAttachmentRepository;
     private final UserService userService;
     private final SkillService skillService;
     private final static String VIEWCOOKIENAME = "alreadyViewCookie";
-    public Portfolio createPortfolio(Portfolio portfolio) {
+    public Portfolio createPortfolio(Portfolio portfolio, List<MultipartFile> images, List<MultipartFile> files) throws IOException{
         User user = portfolio.getUser();
         if (user == null) {
             throw new IllegalArgumentException("User cannot be null");
@@ -51,6 +86,31 @@ public class PortfolioService {
             throw new BusinessLogicException(ExceptionCode.NO_PERMISSION_CREATING_POST);
         }
         portfolio.setUser(verifiedUser.get());
+
+
+        if (!CollectionUtils.isNullOrEmpty(images)) {
+            for (MultipartFile image : images) {
+                String imgUrl = s3Service.uploadFile(image, "images");
+                ImageAttachment imageAttachment = new ImageAttachment(imgUrl);
+                imageAttachment.setPortfolio(portfolio);
+
+                portfolio.getImageAttachments().add(imageAttachment);
+                imageAttachmentRepository.save(imageAttachment);
+
+            }
+        }
+
+        if (!CollectionUtils.isNullOrEmpty(files)) {
+            for (MultipartFile file : files) {
+                String fileUrl = s3Service.uploadFile(file, "files");
+                FileAttachment fileAttachment = new FileAttachment(fileUrl);
+                fileAttachment.setPortfolio(portfolio);
+
+                portfolio.getFileAttachments().add(fileAttachment);
+                fileAttachmentRepository.save(fileAttachment);
+            }
+        }
+
         return portfolioRepository.save(portfolio);
     }
 
@@ -70,6 +130,8 @@ public class PortfolioService {
         Optional.ofNullable(portfolio.getContent())
                 .ifPresent(content -> findPortfolio.setContent(content));
 
+
+
         return portfolioRepository.save(findPortfolio);
     }
 
@@ -81,14 +143,22 @@ public class PortfolioService {
         return (List<Portfolio>) portfolioRepository.findAll();
     }
 
-    public Page<Portfolio> findAllOrderByViewsDesc(int page, int size, Sort.Direction direction) {
-        return portfolioRepository.findAll(PageRequest.of(page, size, direction, "views"));
+//    public Page<Portfolio> findAllOrderByViewsDesc(int page, int size, Sort.Direction direction) {
+//        return portfolioRepository.findAll(PageRequest.of(page, size, direction, "views"));
+//    }
+//
+//    public Page<Portfolio> findAllOrderByCreatedAtDesc(int page, int size, Sort.Direction direction) {
+//        return portfolioRepository.findAll(PageRequest.of(page, size, direction, "createdAt"));
+//    }
+
+
+    public Page<Portfolio> findAllOrderByViewsDesc(int page, int size) {
+        return portfolioRepository.findAll(PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "views")));
     }
 
-    public Page<Portfolio> findAllOrderByCreatedAtDesc(int page, int size, Sort.Direction direction) {
-        return portfolioRepository.findAll(PageRequest.of(page, size, direction, "createdAt"));
+    public Page<Portfolio> findAllOrderByCreatedAtDesc(int page, int size) {
+        return portfolioRepository.findAll(PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "createdAt")));
     }
-
     public void deletePortfolio(long portfolioId) {
         Portfolio portfolio = findVerifiedPortfolio(portfolioId);
         User user = portfolio.getUser();
@@ -103,6 +173,61 @@ public class PortfolioService {
         Optional<Portfolio> optionalPortfolio = portfolioRepository.findById(portfolioId);
         Portfolio findPortfolio = optionalPortfolio.orElseThrow(EntityNotFoundException::new);
         return findPortfolio;
+    }
+
+    public void updateImage(Long portfolioId, List<MultipartFile> images) throws IOException{
+        Portfolio portfolio = findPortfolio(portfolioId);
+        List<ImageAttachment> currentImageAttachments = portfolio.getImageAttachments();
+        currentImageAttachments.clear();
+        imageAttachmentRepository.deleteAll(currentImageAttachments);
+
+        if (!CollectionUtils.isNullOrEmpty(images)) {
+            for (MultipartFile image : images) {
+                String imgUrl = s3Service.uploadFile(image, "images");
+                ImageAttachment imageAttachment = new ImageAttachment(imgUrl);
+                imageAttachment.setPortfolio(portfolio);
+
+                portfolio.getImageAttachments().add(imageAttachment);
+                imageAttachmentRepository.save(imageAttachment);
+
+            }
+        }
+    }
+
+    public void updateFile(Long portfolioId, List<MultipartFile> files) throws IOException{
+        Portfolio portfolio = findPortfolio(portfolioId);
+
+        // 기존 파일 첨부 리스트 삭제
+        List<FileAttachment> currentFileAttachments = portfolio.getFileAttachments();
+        currentFileAttachments.clear();
+        fileAttachmentRepository.deleteAll(currentFileAttachments);
+
+        if (!CollectionUtils.isNullOrEmpty(files)) {
+            for (MultipartFile file : files) {
+                String fileUrl = s3Service.uploadFile(file, "files");
+                FileAttachment fileAttachment = new FileAttachment(fileUrl);
+                fileAttachment.setPortfolio(portfolio);
+
+                portfolio.getFileAttachments().add(fileAttachment);
+                fileAttachmentRepository.save(fileAttachment);
+            }
+        }
+    }
+
+    public void deleteImage(List<String> urlList) {
+        for (String url : urlList) {
+            String originalFileName = url.split("amazonaws.com/")[1];
+            s3Service.removeS3File(originalFileName);
+            imageAttachmentRepository.delete(imageAttachmentRepository.findByImgUrl(url));
+        }
+    }
+
+    public void deleteFile(List<String> urlList) {
+        for (String url : urlList) {
+            String originalFileName = url.split("amazonaws.com/")[1];
+            s3Service.removeS3File(originalFileName);
+            fileAttachmentRepository.delete(fileAttachmentRepository.findByFileUrl(url));
+        }
     }
 
     @Transactional
@@ -151,17 +276,18 @@ public class PortfolioService {
         return (int) now.until(tommorow, ChronoUnit.SECONDS);
     }
 
-    public void addSkills(Portfolio portfolio, String skills) {
+    public void addSkills(Portfolio portfolio, List<String> skills) {
         portfolio.getSkills().forEach(PortfolioSkill::deletePortfolioSkill);
 
         portfolio.getSkills().clear();
 
-        Arrays.asList(skills.split(","))
-                .stream()
+        skills.stream()
                 .map(name -> {
                     return PortfolioSkill.createPortfolioSkill(
-                            skillService.findByName(name.toUpperCase()));
+                            skillService.findByName(name));
                 })
                 .forEach(portfolio::addSkill);
     }
+
+
 }
